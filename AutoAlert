@@ -1,0 +1,653 @@
+import boto3 as aws
+import os
+import hashlib
+import bz2
+import json
+import datetime as dt
+import openpyxl as excel
+from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.worksheet.datavalidation import DataValidation
+
+#----------Variables
+
+j_hashes = {}
+
+f_workbook = None
+xls_headerformat = None
+xls_dataWrap_Locked = None
+xls_lockContent = None
+
+push_name = "lambda"
+push_email = "AutoAlert@lambda.func"
+push_comment = "Automated Upload - Modified file : {0}"
+
+PREV_COMMIT_ID = os.environ.get("PREV_COMMIT_ID")
+REPO_NAME = os.environ['CODECOMMIT_REPO']
+SNS_ARN = os.environ['SNS_ARN']
+REGION = os.environ['AWS_REGION']
+FUNC_NAME=os.environ['AWS_LAMBDA_FUNCTION_NAME']
+CUR_ACC_ID=os.environ['CURRENT_ACCOUNT_ID']
+
+all_namespaces = ["#AWS/ApiGateway","#AWS/Backup","#AWS/Config","#AWS/DirectoryService","#AWS/DynamoDB","#AWS/EBS","#AWS/EC2","#AWS/EFS","#AWS/Events","#AWS/FSx","#AWS/HealthLake","#AWS/Lambda","#AWS/Logs","#AWS/MGN","#AWS/S3","#AWS/SecretsManager","#AWS/SNS","#AWS/States","#AWS/Transfer","#AWS/Usage","#AWS/WorkSpaces"]
+
+j_metricbody = {
+    "METRIC_NAME" : "",
+    "STATE" : "",
+    "STATISTIC" : "",
+    "PERIOD":"",
+    "THRESHOLD_TYPE" : "",
+    "CONDITION" : "",
+    "THRESHOLD" : "",
+    "TIMES_DATAPOINT_TO_ALARM" : "",
+    "OUT_OF_DATAPOINT_TO_ALARM" : "",
+    "TREAT_MISSING_DATA" : "",
+    "ADDITIONAL_DATA" : {},
+    "DIMENSIONS": ""
+}
+
+#----------AWS object
+
+sns = aws.client('sns')
+organ =  aws.client('compute-optimizer')
+cw = aws.client('cloudwatch')
+ec2 = aws.client('ec2')
+cc = aws.client('codecommit')
+eb=aws.client('events')
+lambdaa=aws.client('lambda')
+
+#----------Helper Function
+def debug(string):
+    print("===>  "+string)
+
+#>>HASHES hashing the cloudwatch metrics so they dont repeat when update happens
+def hashIt(string):
+    sha = hashlib.sha1(string.encode('utf-8'))
+    return sha.hexdigest()
+
+def verifyHashFromExistingHashes(namespace,hash):
+    ns_hashes = j_hashes.get(namespace)
+    if ns_hashes != None:
+        if hash not in ns_hashes:
+            ns_hashes.append(hash)
+            j_hashes[namespace] = ns_hashes
+            return False
+        else:
+            return True
+    else:
+        j_hashes[namespace] = [hash]
+        return False
+
+def makeItUnreadable(binarydata):
+    return bz2.compress(binarydata)
+
+def makeItReadable(unreadableData):
+    return bz2.decompress(unreadableData)
+
+#<<HASHES
+
+#>>EXCEL sets the header and format the cell according to the type of header
+def setExcelFormat():
+    global xls_headerformat, xls_dataWrap_Locked,xls_lockContent
+    xls_headerformat = f_workbook.add_format({'bold':True})
+    xls_dataWrap_Locked = f_workbook.add_format({'text_wrap':True, 'locked': True})
+    xls_lockContent = f_workbook.add_format({'locked': True})
+
+def setExcelHeader(worksheet,l_additionaldata):
+    font = Font(bold=True)
+    worksheet.cell(row=1,column=1).value = "METRIC_NAME"
+    worksheet.cell(row=1,column=2).value = "DIMENSIONS"
+    worksheet.cell(row=1,column=3).value = "STATE"
+    worksheet.cell(row=1,column=4).value = "STATISTIC"
+    worksheet.cell(row=1,column=5).value = "PERIOD"
+    worksheet.cell(row=1,column=6).value = "THRESHOLD_TYPE"
+    worksheet.cell(row=1,column=7).value = "CONDITION"
+    worksheet.cell(row=1,column=8).value = "THRESHOLD"
+    worksheet.cell(row=1,column=9).value = "TIMES_DATAPOINT_TO_ALARM"
+    worksheet.cell(row=1,column=10).value = "OUT_OF_DATAPOINT_TO_ALARM"
+    worksheet.cell(row=1,column=11).value = "TREAT_MISSING_DATA"
+    worksheet.cell(row=1,column=12).value = "SNS_ARN"
+    i=13
+    for data in l_additionaldata:
+        worksheet.cell(row=1,column=i).value = data
+        i+=1
+    worksheet.cell(row=1,column=i).value = "ALERT_MESSAGE"
+    worksheet.cell(row=1,column=i+1).value = "REMARKS"
+	
+    for j in range(0,i+1):
+        worksheet.cell(row=1,column=j+1).font = font
+
+def setDataValidationList(cell,data,worksheet):
+    dv_list = DataValidation(type="list", formula1=data, allow_blank=True, showInputMessage=True, showErrorMessage=True)
+    dv_list.error ='Your entry is not in the list'
+    dv_list.errorTitle = 'Invalid Entry'
+    dv_list.prompt = 'Please select from the list'
+    dv_list.promptTitle = 'List Selection'
+
+    worksheet.add_data_validation(dv_list)
+    dv_list.add(cell)
+
+
+def setDataValidationRange(cell,type,operator,formula1,formula2,error,prompt,worksheet):
+    if operator == "between":
+        dv_range = DataValidation(type=type, operator=operator, formula1=formula1, formula2 = formula2, showInputMessage=True, showErrorMessage=True)
+        dv_range.error = error
+        dv_range.errorTitle = 'Invalid Entry'
+        dv_range.prompt = prompt
+        dv_range.promptTitle = 'Enter in Range'
+
+        worksheet.add_data_validation(dv_range)
+        dv_range.add(cell)
+    else:
+        dv_range = DataValidation(type=type, operator=operator, formula1=formula1, showInputMessage=True, showErrorMessage=True)
+        dv_range.error = error
+        dv_range.errorTitle = 'Invalid Entry'
+        dv_range.prompt = prompt
+        dv_range.promptTitle = 'Enter in Range'
+
+        worksheet.add_data_validation(dv_range)
+        dv_range.add(cell)
+
+def setExcelData(worksheet,row,j_data):
+    for k, v in j_data.items():
+        worksheet.cell(row = row, column = k).value = v
+        worksheet.cell(row = row, column = k).alignment = Alignment(wrap_text=True)
+    
+    #list based
+    setDataValidationList("C"+str(row),'"ENABLE,DISABLE"',worksheet)
+    setDataValidationList("D"+str(row),'"Average,Sum,Minimum,Maximum"',worksheet)
+    setDataValidationList("F"+str(row),'"Static,Anamaly"',worksheet)
+    setDataValidationList("G"+str(row),'"GreaterThanOrEqualToThreshold,GreaterThanThreshold,LessThanThreshold,LessThanOrEqualToThreshold,LessThanLowerOrGreaterThanUpperThreshold,LessThanLowerThreshold,GreaterThanUpperThreshold"',worksheet)
+    setDataValidationList("K"+str(row),'"breaching,notBreaching,ignore,missing"',worksheet)
+
+    
+    #number based
+    setDataValidationRange('E'+str(row),"whole","greaterThan",1,None,"In Seconds. Valid values for period are 1, 5, 10, 30, or any multiple of 60. Only positive values are valid","In Seconds. Valid values for period are 1, 5, 10, 30, or any multiple of 60. Only positive values are valid",worksheet)
+    setDataValidationRange('H'+str(row),"decimal","greaterThan",0.0001,None,"IValid values above 0.0001","Valid values above 0.0001",worksheet)
+    setDataValidationRange('I'+str(row),"whole","greaterThan",1,None,"Only positive values are valid","Only positive values are valid",worksheet)
+    setDataValidationRange('J'+str(row),"whole","greaterThan",1,None,"Only positive values are valid","Only positive values are valid",worksheet)
+
+    return worksheet
+#<<EXCEL
+
+def publishToSNS(arn,subject,message):
+	try:
+		response = sns.publish(
+			TopicArn=arn,
+			Message=message,
+			Subject=subject
+		)
+	except Exception as e:
+		print(e)
+
+def readConfigFile():
+    namespaces = []
+    with open('/tmp/AlertNamespace.conf','r') as file:
+        for line in file:
+            if not(line.startswith("#")):
+                namespaces.append(line.strip())
+    return namespaces
+
+def getMetricDimensionList(metric_dimension):
+    dimension = []
+    for d in metric_dimension:
+        dimension.append(d.get("Name")+" = "+d.get("Value"))
+    return dimension
+
+def mapDimensions(dimensions):
+    j_dim = []
+    l_drow = dimensions.split("\n")
+    print(l_drow)
+    for d_row in l_drow:
+        l_d = d_row.split("=")
+        print(l_d)
+        j_dim.append({
+            "Name": l_d[0].strip(),
+            "Value": l_d[1].strip() 
+        }) 
+    return j_dim
+
+def mapHeader2Index(row):
+    headerIndex = {}
+    for ln, cell in enumerate(row):
+        headerIndex[cell.value] = ln
+    return headerIndex
+
+def pushRequiredFile2Repo():
+    b_fileContent = b''
+    with open("/tmp/AutoAlert.xlsx",'rb') as file:
+        for l in file:
+            b_fileContent += file.read()
+    putFileCodeCommit("AutoAlert.xlsx",b_fileContent,push_name,push_email,push_comment.format("AutoAlert.xlsx"))
+
+    b_fileContent = b''
+    with open("/tmp/AlertNamespace.conf",'rb') as file:
+        for l in file:
+            b_fileContent += file.read()
+    putFileCodeCommit("AlertNamespace.conf",b_fileContent,push_name,push_email,push_comment.format("AlertNamespace.conf"))
+
+    os.remove("/tmp/AlertNamespace.conf")
+    os.remove("/tmp/AutoAlert.xlsx")
+
+def getReqiuredFileFromRepo():
+    res = cc.get_file(
+        repositoryName = REPO_NAME,
+        filePath = "AutoAlert.xlsx"
+    )
+    with open("/tmp/AutoAlert.xlsx","wb") as file:
+          file.write(res["fileContent"])
+    
+    res = cc.get_file(
+        repositoryName = REPO_NAME,
+        filePath = "AlertNamespace.conf"
+    )
+
+    with open("/tmp/AlertNamespace.conf","wb") as file:
+        file.write(res["fileContent"])
+
+def add_schedule(name,event_data,time_in_min):
+	rule = eb.put_rule(
+				Name=name,
+				ScheduleExpression="rate({0} minutes)".format(time_in_min),
+				State="ENABLED"
+	)
+
+	lambdaa.add_permission(
+			FunctionName=FUNC_NAME,
+			StatementId=name+"-stmt",
+			Action="lambda:InvokeFunction",
+			Principal="events.amazonaws.com",
+			SourceArn=rule["RuleArn"]
+	)
+	
+	eb.put_targets(
+			Rule=name,
+				Targets=[
+					{
+						"Id": name+"-target",
+						"Arn": "arn:aws:lambda:"+REGION+":"+str(CUR_ACC_ID)+":function:"+FUNC_NAME,
+						"Input": json.dumps(event_data)
+					}
+			]
+	)
+
+def remove_schedule(name):
+		eb.remove_targets(Rule=name, Ids=[name+"-target"])
+		eb.delete_rule(Name=name)
+
+		lambdaa.remove_permission(
+				FunctionName=FUNC_NAME,
+				StatementId=name+"-stmt"
+		)
+#----------Helper Function
+
+# all sheets will contains these column for sure
+# METRIC_NAME,STATE,STATISTIC,PERIOD,THRESHOLD_TYPE,CONDITION,THRESHOLD,TIMES_DATAPOINT_TO_ALARM,OUT_OF_DATAPOINT_TO_ALARM,TREAT_MISSING_DATA,<ResourceName>,DIMENSION
+#
+# STATE - ENABLE, DISABLE
+# STATISTIC - AVERAGE,SUM,MAXIMUM,MINIMUM.... (can custom)
+# PERIODS - In seconds
+# THRESHOLD_TYPE - [STATIC, ANOMOLY]
+
+def setMetricFormatExcel(namespace,worksheet,last_row=None):
+    start = 2 if last_row == None else last_row
+    if namespace == "AWS/EFS":
+        setExcelHeader(worksheet,["NAME","PERFORMANCE_MODE"])
+        # try:
+        res =  cw.list_metrics(
+            Namespace = namespace
+        )
+        efs_metrics=res.get("Metrics")
+        if efs_metrics != None and len(efs_metrics) > 0 :
+            efs_data = {}
+            for ln, metric in enumerate(efs_metrics, start=start):
+                dimension = getMetricDimensionList(metric.get("Dimensions"))
+                if (verifyHashFromExistingHashes("efs",hashIt(dimension))):
+                    continue
+                fs_id = [d.replace('FileSystemId = ','') for d in dimension if d.startswith('FileSystemId')][0]
+                efs_data = getResourceDetails('efs',fs_id,efs_data)
+                worksheet = setExcelData(worksheet,ln,{
+                    1:metric.get("MetricName"),
+                    2:"\n".join(dimension),
+                    13:efs_data[fs_id]["Name"],
+                    14:efs_data[fs_id]["PerformanceMode"]
+                })
+                # if ln == 2:
+                #     for dv in worksheet.data_validations.dataValidation:
+                #         print(dv)
+        else:
+            print("No metrics for EFS")
+        # except Exception as e:
+        #     print(e)
+    
+    elif namespace == "AWS/FSx":
+        setExcelHeader(worksheet,["FILE_SYSYTEM_TYPE","STORAGE_TYPE"])
+        # try:
+        res =  cw.list_metrics(
+            Namespace = namespace
+        )
+        fsx_metrics=res.get("Metrics")
+        if fsx_metrics != None and len(fsx_metrics) > 0 :
+            fsx_data = {}
+            for ln, metric in enumerate(fsx_metrics, start=start):
+                dimension = getMetricDimensionList(metric.get("Dimensions"))
+                if (verifyHashFromExistingHashes("fsx",hashIt(dimension))):
+                    continue
+                fs_id = [d.replace('FileSystemId = ','') for d in dimension if d.startswith('FileSystemId')][0]
+                fsx_data = getResourceDetails('fsx',fs_id,fsx_data)
+                worksheet = setExcelData(worksheet,ln,{
+                    1:metric.get("MetricName"),
+                    2:"\n".join(dimension),
+                    13:fsx_data[fs_id]["FileSystemType"],
+                    14:fsx_data[fs_id]["StorageType"]
+                })
+        else:
+            print("No metrics for FSx")
+    
+    elif namespace == "AWS/EC2":
+        setExcelHeader(worksheet,["NAME","INSTANCE_TYPE","PLATFORM"])
+        # try:
+        res =  cw.list_metrics(
+            Namespace = namespace
+        )
+        ec2_metrics=res.get("Metrics")
+        if ec2_metrics != None and len(ec2_metrics) > 0 :
+            ec2_data = {}
+            #need to complete
+            for ln, metric in enumerate(ec2_metrics, start=start):
+                dimension = getMetricDimensionList(metric.get("Dimensions"))
+                if (verifyHashFromExistingHashes("ec2",hashIt(dimension))):
+                    continue
+                ec2_id = [d.replace('InstanceId = ','') for d in dimension if d.startswith('InstanceId')][0]
+                ec2_data = getResourceDetails('ec2',ec2_id,ec2_data)
+                worksheet = setExcelData(worksheet,ln,{
+                    1:metric.get("MetricName"),
+                    2:"\n".join(dimension),
+                    13:ec2_data[ec2_id]["ec2Name"],
+                    14:ec2_data[ec2_id]["InstanceType"],
+                    15:ec2_data[ec2_id]["Platform"]
+                })
+        else:
+            print("No metrics for EC2")
+     
+
+def initialize(l_namespace):
+    if len(l_namespace) > 0 :
+        global f_workbook 
+        f_workbook = excel.Workbook()
+        #setExcelFormat()
+        for name in l_namespace:
+            worksheet = f_workbook.create_sheet(name.replace('/','-')) 
+            setMetricFormatExcel(name,worksheet) 
+        
+        #writing the hashes in a file and push to repo
+        unreadableData = makeItUnreadable(json.dumps(j_hashes).encode('utf-8'))
+        with open('/tmp/DO-NOT-DELETE-HASHES',"w") as file:
+            file.write(unreadableData)
+        putFileCodeCommit("DO-NOT-DELETE-HASHES",unreadableData,"lambda","lambda@aws","File contains hashes of all the CloudWatch Alert Metrics")
+
+        f_workbook.remove(f_workbook['Sheet'])
+        f_workbook.save("/tmp/AutoAlert.xlsx")
+        #push file repo and delete the local file
+
+def getResourceDetails(clientname,resourceId,resouceData):
+    clientObj = aws.client(clientname)
+    print(resourceId)
+    if clientname == "efs":
+        if resouceData.get(resourceId) == None:
+            res = clientObj.describe_file_systems(
+                FileSystemId = resourceId
+            )
+            resouceData[resourceId] = {
+                'Name' : res["FileSystems"][0]["Name"],
+                'PerformanceMode' : res["FileSystems"][0]["PerformanceMode"]
+            }
+    elif clientname == 'fsx':
+        if resouceData.get(resourceId) == None:
+            res = clientObj.describe_file_systems(
+                FileSystemIds = [resourceId]
+            )
+            resouceData[resourceId] = {
+                'FileSystemType' : res["FileSystems"][0]["FileSystemType"],
+                'StorageType' : res["FileSystems"][0]["StorageType"]
+            }
+    
+    elif clientname == 'ec2':
+        if resouceData.get(resourceId) == None:
+            res = clientObj.describe_instances(
+                InstanceIds =[resourceId]
+            )
+            resouceData[resourceId] = {
+                'Platform' : res["Reservations"][0]["Instances"][0]["Platform"],
+                'InstanceType' : res["Reservations"][0]["Instances"][0]["InstanceType"],
+                'ec2Name' : [tag["Value"] for tag in res["Reservations"][0]["Instances"][0]["Tags"] if tag["Key"] == "Name"][0]
+            }
+
+
+    return resouceData
+
+def createUpdateAlarm(row,ws,resourceName,hIndex):
+    print(row[hIndex["DIMENSIONS"]].value)
+    j_dim = mapDimensions(row[hIndex["DIMENSIONS"]].value)
+    
+    try:
+        debug("Creating alarm...")
+        res = cw.put_metric_alarm(
+            AlarmName = "Alert_{0}_{1}_{2}".format(
+                ws,
+                row[hIndex["METRIC_NAME"]].value,
+                [d["Value"] for d in j_dim if d["Name"] == resourceName][0]
+            ),
+            # Note add description column in excel and map
+            AlarmDescription = row[hIndex["ALERT_MESSAGE"]].value,
+            ActionsEnabled = True if row[hIndex["STATE"]].value == "ENABLE" else False,
+            # Note add sns column in excel and map
+            AlarmActions = [row[hIndex["SNS_ARN"]].value], 
+            MetricName = row[hIndex["METRIC_NAME"]].value,
+            Namespace = ws.replace('-','/'),
+            Statistic = row[hIndex["STATISTIC"]].value,
+            Dimensions  = j_dim,
+            Period = row[hIndex["PERIOD"]].value,
+            Threshold=row[hIndex["THRESHOLD"]].value,
+            ComparisonOperator=row[hIndex["CONDITION"]].value,
+            TreatMissingData=row[hIndex["TREAT_MISSING_DATA"]].value,
+            EvaluationPeriods=row[hIndex["OUT_OF_DATAPOINT_TO_ALARM"]].value,
+            DatapointsToAlarm=row[hIndex["TIMES_DATAPOINT_TO_ALARM"]].value,
+
+        )
+        debug("Alarm Created")
+        row[hIndex["STATE"]].value = "CREATED"
+        row[hIndex["REMARKS"]].value = str(dt.datetime.now())
+        row[hIndex["STATE"]].fill = PatternFill(start_color='00FD00', end_color='00FD00', fill_type = "solid")
+    except Exception as e:
+        debug("Alarm Creation Failed")
+        debug("Error : "+e.response["Error"]["Message"])
+        row[hIndex["STATE"]].value = "FAILED"
+        row[hIndex["STATE"]].fill = PatternFill(start_color='FD0000', end_color='FD0000', fill_type = "solid")
+        row[hIndex["REMARKS"]].value = e.response["Error"]["Code"]+"\n"+e.response["Error"]["Message"]
+
+def updateWorkbookMetric(modified_namespace = None):
+    if not(os.path.isfile("DO-NOT-DELETE-HASHES")):
+        res = cc.get_file(
+            repositoryName = REPO_NAME,
+            filePath = "DO-NOT-DELETE-HASHES"
+        )
+        with open("/tmp/DO-NOT-DELETE-HASHES","wb") as file:
+            file.write(res["fileContent"])
+    unreadable_hashes = None
+    with open("/tmp/DO-NOT-DELETE-HASHES","r") as file:
+        unreadable_hashes = file.readlines()
+    j_hashes = json.loads(makeItReadable(unreadable_hashes).decode('utf-8'))
+    
+    workbook = excel.load_workbook("AutoAlert.xlsx")
+    l_worksheet = workbook.sheetnames
+    if modified_namespace != None:
+        for name in modified_namespace:
+            if name in l_worksheet:
+                worksheet = workbook[ws]
+                setMetricFormatExcel(ws.replace('-','/'),worksheet,worksheet.max_row+1)
+            else:
+                worksheet = f_workbook.create_sheet(name.replace('/','-')) 
+                setMetricFormatExcel(name,worksheet)
+    else:
+        for ws in l_worksheet:
+            worksheet = workbook[ws]
+            setMetricFormatExcel(ws.replace('-','/'),worksheet,worksheet.max_row+1)      
+   
+    #writing the hashes in a file and push to repo
+    unreadableData = makeItUnreadable(json.dumps(j_hashes).encode('utf-8'))
+    with open('/tmp/DO-NOT-DELETE-HASHES',"w") as file:
+        file.write(unreadableData)
+    putFileCodeCommit("DO-NOT-DELETE-HASHES",unreadableData,"lambda","lambda@aws","File contains hashes of all the CloudWatch Alert Metrics")
+
+    f_workbook.save("/tmp/AutoAlert.xlsx")
+
+
+def readExcelSheet():
+    workbook = excel.load_workbook("AutoAlert.xlsx")
+    l_worksheet = workbook.sheetnames
+
+    l_active_namespace = readConfigFile()
+    
+    for ws in l_worksheet:
+        if ws not in l_active_namespace:
+            debug("Skiping worksheeet \"{0}\" as its commented in AlertNamespace.conf".format(ws))
+        else:
+            debug("Parsing worksheet {0}".format(ws))
+        resourceName = None
+        if ws == 'AWS-EFS':
+            resourceName = 'FileSystemId'
+        worksheet = workbook[ws]
+        headerIndex = {}
+        for ln, row in enumerate(worksheet.iter_rows()):
+            if ln == 0:
+                headerIndex = mapHeader2Index(row)
+            else:
+                if row[headerIndex["STATE"]].value not in [None,"CREATED","FAILED"]:
+                    debug("Reading line : "+ln)
+                    debug("Dimesion are following: \n{0}".format(row[headerIndex["DIMENSION"]]))
+                    createUpdateAlarm(row,ws,resourceName,headerIndex)
+                    debug("----------------------------")
+
+    workbook.save("/tmp/AutoAlert.xlsx") 
+
+# >>DONE
+# CodeCommit working
+# Create a trigger for SNS in lambda
+# fetch the commitid and save it in temp memory first Time
+# now whenever lambda is triggered from SNS 
+#     Pick the commit id
+#     Execute the "get differences" api by passing commitid saved and recieved.
+#     update the memory with new commitid
+#     check if file modified is the one we need and continue processing.
+#     Also fetch the commit details by using "get commit" api
+def getLastCommitFileDetails(commitId):
+    commit_res = cc.get_commit(
+        repositoryName=REPO_NAME,
+        commitId=commitId
+    )
+    if commit_res["commit"]["committer"]["name"] == "lambda":
+        return [{"name" : "lambda"}]
+    
+    if PREV_COMMIT_ID != None:
+        res = cc.get_differences(
+                repositoryName=REPO_NAME,
+                beforeCommitSpecifier=PREV_COMMIT_ID,
+                afterCommitSpecifier=commitId
+            )
+    else:
+        res = cc.get_differences(
+                repositoryName=REPO_NAME,
+                afterCommitSpecifier=commitId
+            )
+
+    os.environ['PREV_COMMIT_ID'] = commitId
+    f_details = []
+    for diff in res["differences"]:
+        if diff["afterBlob"]["path"] in ["AutoAlert.xlsx","AlertNamespace.conf"]:
+            getReqiuredFileFromRepo()
+            commit_res = cc.get_commit(
+                repositoryName=REPO_NAME,
+                commitId=commitId
+            )
+            f_details.append( {
+                "f_name" : diff["afterBlob"]["path"],
+                "name" : commit_res["commit"]["committer"]["name"],
+                "email" : commit_res["commit"]["committer"]["email"], 
+                "message": commit_res["commit"]["committer"]["message"],
+                "operation" : diff["changeType"]
+            })
+    return f_details
+
+def putFileCodeCommit(f_name,f_content,name,email,comment):
+    res = None
+    print(PREV_COMMIT_ID)
+
+    if PREV_COMMIT_ID != "''" :
+        res = cc.put_file(
+                repositoryName=REPO_NAME,
+                branchName='main',
+                fileContent=f_content,
+                filePath=REPO_NAME+'/'+f_name,
+                fileMode='NORMAL',
+                parentCommitId=PREV_COMMIT_ID, 
+                commitMessage=comment,
+                name=name,
+                email=email
+            )
+    else:
+        print("in else")
+        res = cc.put_file(
+            repositoryName=REPO_NAME,
+            branchName='main',
+            fileContent=f_content,
+            filePath=REPO_NAME+'/'+f_name,
+            fileMode='NORMAL',
+            commitMessage=comment,
+            name=name,
+            email=email
+        )
+    
+
+def lambda_handler(event, context):
+    cs = aws.client
+    if(event.get("Records")):
+        if event["Records"][0]["EventSource"] == "aws:sns":
+            f_details = getLastCommitFileDetails(events["Records"][0]["Sns"]["Message"]["detail"]["commitId"])
+            debug(f_details)
+            for f in f_details:
+                if f["name"] != "lambda":
+                    if f["f_name"] == "AutoAlert.xlsx":
+                        if f["operation"] in ["A","M"]:
+                            readExcelSheet()
+                        elif f["operation"] == "D":
+                            publishToSNS(SNS_ARN,"DELETED | AutoAlert.xlsx","AutoAlert.xlsx file is deleted. Request you to revert it or else file be recreated on AutoAlert.xslx will be hampered")
+                    elif f["f_name"] == "AlertNamespace.conf":
+                        if f["operation"] in ["A","M"]:
+                            #perform action
+                            l_modified_namespace = readConfigFile()
+                            if len(l_modified_namespace) > 0:
+                                if os.path.isfile("AutoAlert.xlsx"):
+                                    updateWorkbookMetric(l_modified_namespace)
+                                else:
+                                    initialize(l_modified_namespace)
+                        elif f["operation"] == "D":
+                           publishToSNS(SNS_ARN,"DELETED | AlertNamespace.conf","AlertNamespace.conf file is deleted. Request you to revert it or else operation on AutoAlert.xslx will be hampered")
+            if len(f_details) > 0:
+                pushRequiredFile2Repo()
+    elif(event.get("do")=="update"):
+        updateWorkbookMetric()	
+    else:
+        #add_schedule("AutoAlertUpdateMetrics",{'do':'update'},720)
+        # create codecommit notification -- (needs to create topic) and add permission to lambda
+
+        with open("/tmp/AlertNamespace.conf",'w') as file:
+            file.write("\n".join(all_namespaces)) 
+
+        b_fileContent = b''
+        with open("/tmp/AlertNamespace.conf",'rb') as file:
+            for l in file:
+                b_fileContent += file.read()
+        putFileCodeCommit("AlertNamespace.conf",b_fileContent,push_name,push_email,push_comment.format("AlertNamespace.conf"))
+
+        
+##!!!! TBC = create SNS helpers etc. Dry run code.
